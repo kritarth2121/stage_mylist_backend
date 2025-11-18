@@ -1,0 +1,174 @@
+name: CI/CD Pipeline with AWS EC2 Deployment
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:6
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 27017:27017
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm test
+        env:
+          MONGODB_URI: mongodb://localhost:27017/ott-mylist-test
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+
+      - name: Run performance tests
+        run: npm test -- src/tests/performance.test.ts
+        env:
+          MONGODB_URI: mongodb://localhost:27017/ott-mylist-test
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy-to-ec2:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to AWS EC2
+        env:
+          AWS_EC2_HOST: ${{ secrets.AWS_EC2_HOST }}
+          AWS_EC2_USER: ${{ secrets.AWS_EC2_USER }}
+          AWS_EC2_KEY: ${{ secrets.AWS_EC2_KEY }}
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          # Create SSH key file
+          mkdir -p ~/.ssh
+          echo "$AWS_EC2_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $AWS_EC2_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # Deploy script
+          ssh -i ~/.ssh/deploy_key $AWS_EC2_USER@$AWS_EC2_HOST << 'EOF'
+            set -e
+            
+            # Variables
+            CONTAINER_NAME="my-list-api"
+            IMAGE="${{ env.DOCKER_IMAGE }}"
+            
+            echo "[Deploy] Pulling latest image..."
+            docker pull $IMAGE
+            
+            echo "[Deploy] Stopping old container..."
+            docker stop $CONTAINER_NAME || true
+            docker rm $CONTAINER_NAME || true
+            
+            echo "[Deploy] Starting new container..."
+            docker run -d \
+              --name $CONTAINER_NAME \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
+              -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+              -e NODE_ENV="production" \
+              $IMAGE
+            
+            echo "[Deploy] Waiting for service to be healthy..."
+            for i in {1..30}; do
+              if curl -f http://localhost:3000/health; then
+                echo "[Deploy] Service is healthy!"
+                exit 0
+              fi
+              echo "Attempt $i/30 - Service not ready yet, waiting..."
+              sleep 2
+            done
+            
+            echo "[Deploy] Failed - service did not become healthy"
+            exit 1
+          EOF
+
+      - name: Verify deployment
+        env:
+          AWS_EC2_HOST: ${{ secrets.AWS_EC2_HOST }}
+        run: |
+          echo "[Verify] Testing API endpoint..."
+          curl -f https://$AWS_EC2_HOST/health || echo "Note: Direct HTTPS test may fail if using IP - check via your domain"
