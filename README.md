@@ -1,6 +1,6 @@
 # OTT Platform - My List Backend Service
 
-A high-performance backend service for managing user's "My List" feature on an OTT (Over-The-Top) platform. Built with Express.js, MongoDB, TypeScript, and optimized for scalability and sub-10ms response times.
+A high-performance backend service for managing user's "My List" feature on an OTT (Over-The-Top) platform. Built with Express.js, MongoDB, TypeScript, and optimized for scalability and sub-10ms response times. 
 
 ## Features
 
